@@ -1,0 +1,149 @@
+---
+title: "Serie Storiche: Produzione Industriale del Giappone"
+subtitle: "1955 - 2024"
+author: "Dario Falaschi"
+date: "2026-03-16"
+output:
+  github_document:
+    html_preview: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=FALSE)
+```
+
+```{r libraries}
+library(ggplot2)
+library(forecast)
+library(patchwork)
+```
+
+# 1. Importazione e Creazione della Serie Storica ---
+Questo script contiene l'analisi della serie storica relativa all'Indice della Produzione Industriale del Giappone. I dati mensili grezzi sono stati estratti dal database FRED ([Serie: JPNPRINTO01IXOBM](https://fred.stlouisfed.org/series/JPNPRINTO01IXOBM)).
+Al fine di garantire la perfetta integrità dei cicli stagionali, la serie storica analizzata viene troncata a Dicembre 2022, garantendo 68 anni di osservazioni complete.
+Il 2023 e i primi mesi del 2024 verranno conservati come Test Set per la validazione dei modelli.
+
+```{r import}
+dati_giappone <- read.csv("JPNPRINTO01IXOBM.csv")
+colnames(dati_giappone) <- c("Data", "Produzione")
+
+serie_completa <- ts(dati_giappone$Produzione, start = c(1955, 1), frequency = 12)
+serie_finale <- window(serie_completa, end = c(2022, 12)) # Train Set
+serie_test <- window(serie_completa, start = c(2023, 1))  # Test Set
+
+autoplot(serie_completa, main = "Produzione Industriale - Giappone (1955 - 2024)", 
+         ylab = "Indice di Produzione", xlab = "Anno")
+```
+
+L'analisi visiva preliminare mostra un evidente e persistente trend di crescita fino all'inizio degli anni '90, seguito dai periodi di stagnazione economica e dalle forti crisi del 2008 e 2020.
+Si nota inoltre un pattern stagionale la cui varianza aumenta proporzionalmente alla crescita del trend.
+
+# 2 Analisi dell'Autocorrelazione (ACF) e Grafici Stagionali
+
+Per confermare formalmente la non-stazionarietà della serie e la forte stagionalità intravista nel grafico principale, calcoliamo la Funzione di Autocorrelazione.
+
+```{r autocorrelazione}
+ggAcf(serie_finale, lag = 48, main = "ACF: Produzione Industriale Giappone")
+```
+
+Il correlogramma mostra un decadimento estremamente lento, sintomo inequivocabile di un trend persistente, accompagnato da "onde" periodiche che riflettono la stagionalità del dato.
+Per evidenziare meglio questi pattern annuali ricorrenti, analizziamo il grafico stagionale e il grafico delle sotto-serie.
+
+```{r grafici_stagionali}
+p1 <- ggseasonplot(serie_finale, continuous = TRUE,  main = "Plot Stagionale: Produzione Giappone", ylab = "Indice", xlab = "Mese")
+
+p2 <- ggsubseriesplot(serie_finale, main = "Grafico di Sotto-serie", ylab = "Indice")
+
+p1 / p2 # Mostriamo i grafici
+```
+
+# 3. Decomposizione
+Considerando l'ampio orizzonte temporale (1955-2022) e l'evidente aumento della varianza in concomitanza con la crescita del trend, la scomposizione additiva risulterebbe inadeguata.
+Si procede pertanto con una decomposizione moltiplicativa per isolare le tre componenti: Trend, Stagionalità e Rumore.
+
+```{r decomposizione}
+dec_giappone <- decompose(serie_finale, type = "multiplicative")
+autoplot(dec_giappone)
+```
+
+# 4. Modelli di Predizione di Base
+Prima di passare a modelli più complessi, è fondamentale testare algoritmi elementari per definire una base di performance.
+Vengono stimati tre modelli di base sull'orizzonte temporale del Test Set.
+
+```{r modelli_base}
+h_prev <- length(serie_test) # Orizzonte di previsione pari alla lunghezza del test set
+
+prev_naive <- naive(serie_finale, h = h_prev)
+prev_snaive <- snaive(serie_finale, h = h_prev)
+prev_drift <- rwf(serie_finale, drift = TRUE, h = h_prev)
+
+# Grafico delle previsioni elementari
+autoplot(window(serie_finale, start = c(2020, 1))) +
+  autolayer(serie_test, series="Dati Reali 2023-24") +
+  autolayer(prev_naive$mean, series="Naive") +
+  autolayer(prev_snaive$mean, series="Seasonal Naive") +
+  autolayer(prev_drift$mean, series="Drift") +
+  ylab("Indice Produzione") + ggtitle("Previsioni Elementari su 2023-24") +
+  guides(colour = guide_legend(title = "Modelli:"))
+```
+
+# 5. Modello Esponenziale Holt-Winters
+Dato che la serie storica presenta sia un trend evidente sia una forte stagionalità moltiplicativa, il modello matematico di lisciamento esponenziale di Holt-Winters rappresenta una soluzione ideale.
+Si addestra il modello specificando la natura moltiplicativa della stagionalità.
+
+Il grafico sottostante mostra la previsione puntuale del modello affiancata dai rispettivi intervalli di previsione standard (all'80% e al 95%).
+
+```{r modello_Holt_Winters}
+mod_hw <- hw(serie_finale, seasonal = "multiplicative", h = h_prev)
+
+autoplot(window(serie_finale, start = c(2020, 1))) +
+  autolayer(mod_hw, series="Holt-Winters", PI=TRUE) +
+  autolayer(serie_test, series="Dati Reali 2023-24", lwd=1.2) +
+  ylab("Indice Produzione") + ggtitle("Previsione Holt-Winters con Intervalli Standard") +
+  guides(colour = guide_legend(title = "Legenda:"))
+```
+
+Per convalidare la correttezza strutturale del modello e l'affidabilità degli intervalli di previsione appena mostrati, si procede all'analisi formale dei residui.
+
+```{r analisi_residui}
+checkresiduals(mod_hw)
+shapiro.test(residuals(mod_hw))
+```
+
+I test hanno respinto l'ipotesi di gaussianità dei residui, evidenziando la presenza di outlier legati agli shock economici. 
+L'assunzione di normalità alla base degli intervalli (mostrati nel primo grafico) rischia quindi di sottostimare la reale incertezza futura.
+Per correggere questo problema, si ricalcolano gli intervalli di previsione utilizzando il metodo Bootstrap. 
+
+```{r bootstrap}
+prev_hw_boot <- forecast(mod_hw$model, h = h_prev, bootstrap = TRUE)
+
+autoplot(window(serie_finale, start = c(2020, 1))) +
+  autolayer(prev_hw_boot, series="Holt-Winters (Bootstrap)", PI=TRUE) +
+  autolayer(serie_test, series="Dati Reali 2023-24", lwd=1.2) +
+  ylab("Indice Produzione") + 
+  ggtitle("Previsione Holt-Winters con Intervalli Bootstrap") +
+  guides(colour = guide_legend(title = "Legenda:"))
+```
+
+# 6. Previsioni Finali e Validazione
+Per decretare il modello migliore, confrontiamo prima visivamente le due previsioni più rilevanti (Seasonal Naive e Holt-Winters) con i dati veri del Test Set (Gennaio 2023 - Marzo 2024).
+Successivamente, valutiamo sul Test Set l'errore quadratico medio (RMSE), l'errore assoluto medio (MAE) e l'errore percentuale assoluto medio (MAPE) di tutti i modelli stimati.
+
+```{r final}
+# Grafico comparativo: Dati Reali vs SNaive vs Holt-Winters
+autoplot(window(serie_finale, start = c(2020, 1))) +
+  autolayer(serie_test, series="Dati Reali 2023-24") +
+  autolayer(prev_snaive$mean, series="Seasonal Naive") +
+  autolayer(mod_hw$mean, series="Holt-Winters") +
+  ylab("Indice Produzione") + 
+  ggtitle("Confronto Previsioni: SNaive vs Holt-Winters") +
+  guides(colour = guide_legend(title = "Modelli:")) 
+
+modelli <- list("Naive" = prev_naive, "Seasonal Naive" = prev_snaive,
+                "Drift" = prev_drift, "Holt-Winters" = mod_hw)
+
+# Errori di previsione sul Test Set per ciascun modello
+risultati <- t(sapply(modelli, function(m) accuracy(m, serie_test)["Test set", c("RMSE", "MAE", "MAPE")]))
+
+print(round(risultati, 2))
+```
