@@ -1,0 +1,2 @@
+# Statistiche dei linguaggi su GitHub: i report R Markdown contengono codice R
+*.Rmd linguist-language=R
